@@ -34,16 +34,20 @@ EMOTION_TRANSLATIONS = {
     "neutral": "Нейтрально",
 }
 
-# Simplified session state keys
+# Simplified session state keys ### MODIFIED ###
 STATE = {
     "video_path": "video_path",
     "results_df": "results_df",
+    "feedback_choice": "feedback_choice", # NEW
+    "feedback_comment": "feedback_comment", # NEW
 }
 
-# Initialize session state with defaults
+# Initialize session state with defaults ### MODIFIED ###
 for key, default in [
     (STATE["video_path"], None),
     (STATE["results_df"], None),
+    (STATE["feedback_choice"], None), # NEW
+    (STATE["feedback_comment"], ""),   # NEW
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -308,9 +312,15 @@ def main():
         emotion_list = [f"- **{EMOTION_TRANSLATIONS.get(e)}** ({e})" for e in EMOTION_OPTIONS]
         st.markdown("\n".join(emotion_list))
 
+    ### MODIFIED: Added reset for feedback state ###
     uploaded_file = st.file_uploader(
         "Выберите видеофайл", type=["mp4", "mov", "avi", "mkv"],
-        on_change=lambda: st.session_state.update({STATE["results_df"]: None, STATE["video_path"]: None})
+        on_change=lambda: st.session_state.update({
+            STATE["results_df"]: None,
+            STATE["video_path"]: None,
+            STATE["feedback_choice"]: None,
+            STATE["feedback_comment"]: "",
+        })
     )
 
     if uploaded_file is not None:
@@ -379,14 +389,56 @@ def main():
             display_df.columns = ["Timestamp (s)"] + [EMOTION_TRANSLATIONS.get(e, e) for e in EMOTION_OPTIONS]
             st.dataframe(display_df, use_container_width=True)
 
-            # --- 3. CSV Download ---
+            ### NEW FEATURE START: Feedback Section ###
+            st.divider()
+            st.subheader("📝 Обратная связь по результатам")
+            st.write("Помогите нам улучшить модель. Результаты анализа верны?")
+
+            col1, col2 = st.columns(2)
+
+            if col1.button("✅ Да, согласен", use_container_width=True):
+                st.session_state[STATE["feedback_choice"]] = "Agree"
+                st.session_state[STATE["feedback_comment"]] = "" # Clear comment if they switch
+
+            if col2.button("❌ Нет, не согласен", use_container_width=True):
+                st.session_state[STATE["feedback_choice"]] = "Disagree"
+            
+            if st.session_state[STATE["feedback_choice"]] == "Agree":
+                st.success("Спасибо за ваш отзыв! Мы ценим вашу помощь.")
+            
+            if st.session_state[STATE["feedback_choice"]] == "Disagree":
+                st.warning("Спасибо за ваш отзыв! Пожалуйста, опишите, что, по вашему мнению, не так.")
+                st.text_area(
+                    label="Ваш комментарий:",
+                    key=STATE["feedback_comment"], # Binds the widget's state directly to the session state key
+                    height=100,
+                    placeholder="Например: 'В начале видео была грусть, а не нейтральное состояние'."
+                )
+            ### NEW FEATURE END ###
+
+            # --- 3. CSV Download --- ### MODIFIED ###
+            st.divider()
+            
             csv_buffer = io.StringIO()
+            
+            # --- Prepend feedback metadata to the CSV string ---
+            feedback_choice = st.session_state.get(STATE["feedback_choice"])
+            feedback_comment = st.session_state.get(STATE["feedback_comment"])
+
+            if feedback_choice:
+                csv_buffer.write(f"# FEEDBACK: {feedback_choice}\n")
+                if feedback_choice == "Disagree" and feedback_comment:
+                    # Clean comment to ensure it's a single line
+                    cleaned_comment = feedback_comment.replace('\n', ' ').replace('\r', '')
+                    csv_buffer.write(f"# COMMENT: {cleaned_comment}\n")
+                csv_buffer.write("\n") # Add a blank line for separation before the data
+
             display_df.to_csv(csv_buffer, index=False, encoding="utf-8-sig")
             
             video_name = Path(uploaded_file.name).stem
             st.download_button(
                 label="📥 Скачать детальные результаты (CSV)", data=csv_buffer.getvalue(),
-                file_name=f"{video_name}_emotion_time_series.csv", mime="text/csv", type="primary"
+                file_name=f"{video_name}_emotion_analysis_with_feedback.csv", mime="text/csv", type="primary"
             )
 
 if __name__ == "__main__":
