@@ -33,21 +33,27 @@ EMOTION_TRANSLATIONS = {
     "surprise": "Удивление",
     "neutral": "Нейтрально",
 }
+# Reverse mapping for internal use when updating the state from the edited table
+REVERSE_EMOTION_TRANSLATIONS = {v: k for k, v in EMOTION_TRANSLATIONS.items()}
+REVERSE_EMOTION_TRANSLATIONS["Timestamp (s)"] = "Timestamp (s)"
 
-# Simplified session state keys ### MODIFIED ###
+
+# Simplified session state keys
 STATE = {
     "video_path": "video_path",
     "results_df": "results_df",
-    "feedback_choice": "feedback_choice", # NEW
-    "feedback_comment": "feedback_comment", # NEW
+    "edited_df": "edited_df",
+    "feedback_choice": "feedback_choice",
+    "feedback_comment": "feedback_comment",
 }
 
-# Initialize session state with defaults ### MODIFIED ###
+# Initialize session state with defaults
 for key, default in [
     (STATE["video_path"], None),
     (STATE["results_df"], None),
-    (STATE["feedback_choice"], None), # NEW
-    (STATE["feedback_comment"], ""),   # NEW
+    (STATE["edited_df"], None),
+    (STATE["feedback_choice"], None),
+    (STATE["feedback_comment"], ""),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -96,7 +102,6 @@ def load_models(use_gpu: bool = True, use_fp16: bool = True) -> Optional[ModelBu
         yolo.to("cuda" if device.type == "cuda" else "cpu")
         yolo.fuse()
 
-        # model_name = "trpakov/vit-face-expression"
         model_name = "mo-thecreator/vit-Facial-Expression-Recognition"
         processor = AutoImageProcessor.from_pretrained(model_name)
         expr_model = AutoModelForImageClassification.from_pretrained(model_name).to(device).eval()
@@ -195,7 +200,6 @@ def predict_expressions_batch(
         else:
             logits = expr_model(**inputs).logits
 
-    # Use softmax to get probabilities for all emotions
     probabilities = torch.nn.functional.softmax(logits, dim=-1)
     
     labels = expr_model.config.id2label
@@ -204,7 +208,6 @@ def predict_expressions_batch(
         prob_dict = {labels[i]: p.item() * 100 for i, p in enumerate(prob_tensor)}
         results_list.append(prob_dict)
 
-    # Re-insert None for frames where no face was detected
     result_iter = iter(results_list)
     return [next(result_iter) if face else None for face in faces]
 
@@ -237,7 +240,7 @@ def process_video(
     if duration == 0:
         raise ValueError("Видео имеет нулевую длительность или не может быть прочитано.")
 
-    step_sec = 1.0  # Analyze one frame per second
+    step_sec = 1.0
     total_steps = max(1, int(np.ceil(duration / step_sec)))
     
     all_results: List[Tuple[float, Optional[Dict[str, float]]]] = []
@@ -267,14 +270,14 @@ def process_video(
         if emotions_dict:
             for emotion, percentage in emotions_dict.items():
                 record[emotion] = round(percentage, 2)
-        else: # Fill with 0 if no face is detected
+        else:
             for emotion in EMOTION_OPTIONS:
                 record[emotion] = 0.0
         records.append(record)
     
     df = pd.DataFrame(records)
     
-    for emotion in EMOTION_OPTIONS: # Ensure all emotion columns exist
+    for emotion in EMOTION_OPTIONS:
         if emotion not in df.columns:
             df[emotion] = 0.0
             
@@ -312,11 +315,11 @@ def main():
         emotion_list = [f"- **{EMOTION_TRANSLATIONS.get(e)}** ({e})" for e in EMOTION_OPTIONS]
         st.markdown("\n".join(emotion_list))
 
-    ### MODIFIED: Added reset for feedback state ###
     uploaded_file = st.file_uploader(
         "Выберите видеофайл", type=["mp4", "mov", "avi", "mkv"],
         on_change=lambda: st.session_state.update({
             STATE["results_df"]: None,
+            STATE["edited_df"]: None,
             STATE["video_path"]: None,
             STATE["feedback_choice"]: None,
             STATE["feedback_comment"]: "",
@@ -345,25 +348,53 @@ def main():
                         progress_cb=lambda p: progress_bar.progress(p, text=f"Обработка... {int(p*100)}%")
                     )
                     st.session_state[STATE["results_df"]] = df
+                    st.session_state[STATE["edited_df"]] = df.copy()
                     progress_bar.empty()
                 except Exception as e:
                     st.error(f"Произошла ошибка при обработке: {e}")
                     progress_bar.empty()
 
-    if st.session_state[STATE["results_df"]] is not None:
+    if st.session_state[STATE["edited_df"]] is not None:
         st.divider()
         st.subheader("📈 Результаты анализа")
-        time_series_df = st.session_state[STATE["results_df"]]
+        
+        # Make a local copy of the dataframe from the session state
+        time_series_df = st.session_state[STATE["edited_df"]]
 
         if time_series_df.empty or time_series_df.drop("Timestamp (s)", axis=1).sum().sum() == 0:
             st.warning("Не удалось обнаружить эмоции в видео. Возможно, на видео нет лиц.")
         else:
-            # --- 1. Summary: Average percentages ---
-            st.write("#### Сводка: Средний процент эмоций")
-            st.info("Средние значения рассчитаны только для тех моментов, когда было обнаружено лицо.")
+            ### MODIFIED: REORDERED LOGIC ###
+            # --- 1. Display and process the editable table FIRST ---
+            st.write("#### Детальные данные по времени (в процентах)")
+            st.caption("Вы можете редактировать значения в этой таблице. Все графики и CSV-файл обновятся автоматически.")
+
+            df_for_editor = time_series_df.copy()
+            df_for_editor.columns = ["Timestamp (s)"] + [EMOTION_TRANSLATIONS.get(e, e) for e in EMOTION_OPTIONS]
+
+            # Get the latest data from the editor. This is the source of truth.
+            edited_df_with_russian_cols = st.data_editor(
+                df_for_editor,
+                use_container_width=True,
+                disabled=["Timestamp (s)"],
+                num_rows="fixed"
+            )
+
+            # Convert column names back to English to update state and for calculations
+            df_with_english_cols = edited_df_with_russian_cols.rename(columns=REVERSE_EMOTION_TRANSLATIONS)
             
-            emotion_cols = time_series_df[EMOTION_OPTIONS]
-            valid_frames = emotion_cols.sum(axis=1) > 1 # Sum > 1 to be safe with float precision
+            # Immediately update session state with the new, correct data
+            st.session_state[STATE["edited_df"]] = df_with_english_cols
+            # --- END OF FIRST BLOCK ---
+
+            # --- 2. Summary: Average percentages (uses the UPDATED data) ---
+            st.divider()
+            st.write("#### Сводка: Средний процент эмоций")
+            st.info("Средние значения рассчитаны только для тех моментов, когда было обнаружено лицо. Графики обновляются после ваших правок в таблице.")
+            
+            # Now, calculations use the fresh data from the editor
+            emotion_cols = df_with_english_cols[EMOTION_OPTIONS]
+            valid_frames = emotion_cols.sum(axis=1) > 1
             
             avg_emotions = emotion_cols[valid_frames].mean() if valid_frames.any() else pd.Series(0.0, index=EMOTION_OPTIONS)
 
@@ -376,20 +407,16 @@ def main():
             st.bar_chart(chart_data["Процент"])
             st.dataframe(summary_df, use_container_width=True)
 
-            # --- 2. Time-series chart and data ---
+            # --- 3. Time-series chart (uses the UPDATED data) ---
             st.divider()
             st.write("#### Динамика эмоций во времени")
             
-            chart_df = time_series_df.set_index("Timestamp (s)")
+            # Chart also uses the fresh data
+            chart_df = df_with_english_cols.set_index("Timestamp (s)")
             chart_df.columns = [EMOTION_TRANSLATIONS.get(col, col) for col in chart_df.columns]
             st.line_chart(chart_df)
             
-            st.write("#### Детальные данные по времени (в процентах)")
-            display_df = time_series_df.copy()
-            display_df.columns = ["Timestamp (s)"] + [EMOTION_TRANSLATIONS.get(e, e) for e in EMOTION_OPTIONS]
-            st.dataframe(display_df, use_container_width=True)
-
-            ### NEW FEATURE START: Feedback Section ###
+            # --- 4. Feedback Section ---
             st.divider()
             st.subheader("📝 Обратная связь по результатам")
             st.write("Помогите нам улучшить модель. Результаты анализа верны?")
@@ -398,7 +425,7 @@ def main():
 
             if col1.button("✅ Да, согласен", use_container_width=True):
                 st.session_state[STATE["feedback_choice"]] = "Agree"
-                st.session_state[STATE["feedback_comment"]] = "" # Clear comment if they switch
+                st.session_state[STATE["feedback_comment"]] = ""
 
             if col2.button("❌ Нет, не согласен", use_container_width=True):
                 st.session_state[STATE["feedback_choice"]] = "Disagree"
@@ -410,30 +437,28 @@ def main():
                 st.warning("Спасибо за ваш отзыв! Пожалуйста, опишите, что, по вашему мнению, не так.")
                 st.text_area(
                     label="Ваш комментарий:",
-                    key=STATE["feedback_comment"], # Binds the widget's state directly to the session state key
+                    key=STATE["feedback_comment"],
                     height=100,
                     placeholder="Например: 'В начале видео была грусть, а не нейтральное состояние'."
                 )
-            ### NEW FEATURE END ###
 
-            # --- 3. CSV Download --- ### MODIFIED ###
+            # --- 5. CSV Download (uses the UPDATED data) ---
             st.divider()
             
             csv_buffer = io.StringIO()
             
-            # --- Prepend feedback metadata to the CSV string ---
             feedback_choice = st.session_state.get(STATE["feedback_choice"])
             feedback_comment = st.session_state.get(STATE["feedback_comment"])
 
             if feedback_choice:
                 csv_buffer.write(f"# FEEDBACK: {feedback_choice}\n")
                 if feedback_choice == "Disagree" and feedback_comment:
-                    # Clean comment to ensure it's a single line
                     cleaned_comment = feedback_comment.replace('\n', ' ').replace('\r', '')
                     csv_buffer.write(f"# COMMENT: {cleaned_comment}\n")
-                csv_buffer.write("\n") # Add a blank line for separation before the data
+                csv_buffer.write("\n")
 
-            display_df.to_csv(csv_buffer, index=False, encoding="utf-8-sig")
+            # Use the dataframe that came directly from the editor for the CSV
+            edited_df_with_russian_cols.to_csv(csv_buffer, index=False, encoding="utf-8-sig")
             
             video_name = Path(uploaded_file.name).stem
             st.download_button(
